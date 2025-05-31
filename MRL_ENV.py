@@ -9,7 +9,7 @@ from collections import defaultdict
 
 class SensorNetworkLocalizationEnv(gym.Env):
     """
-    多智能体传感器网络定位环境
+    多智能体传感器网络定位环境 - MAPPO版本
     基于连续动作空间和分层奖励结构的强化学习环境
     """
 
@@ -26,24 +26,9 @@ class SensorNetworkLocalizationEnv(gym.Env):
                  render_mode: str = None,
                  dimension: int = 2,
                  reward_scale: float = 1.0,
-                 global_reward_freq: int = 5):  # 新增参数：全局奖励计算频率
+                 global_reward_freq: int = 5,
+                 use_centralized_critic: bool = True):
 
-        """
-        初始化传感器网络定位环境
-
-        Args:
-            anchors_pos: 锚点位置
-            sensor_pos: 传感器真实位置
-            estimated_positions: 初始估计位置
-            communication_range: 通信范围
-            noise_std: 噪声标准差
-            max_episode_steps: 最大步数
-            initial_pos_bounds: 位置边界范围 [[x_min, x_max], [y_min, y_max]]
-            render_mode: 渲染模式
-            dimension: 空间维度（2D或3D）
-            reward_scale: 奖励缩放因子
-            global_reward_freq: 全局奖励计算频率（每多少步计算一次）
-        """
         super(SensorNetworkLocalizationEnv, self).__init__()
         self.anchors_pos = np.array(anchors_pos, dtype=np.float32)
         self.sensor_pos = np.array(sensor_pos, dtype=np.float32)
@@ -56,32 +41,39 @@ class SensorNetworkLocalizationEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.dimension = dimension
         self.reward_scale = reward_scale
-        self.global_reward_freq = global_reward_freq  # 全局奖励计算频率
+        self.global_reward_freq = global_reward_freq
+        self.use_centralized_critic = use_centralized_critic
 
-        # MADDPG需要的智能体列表
+        # MAPPO需要的智能体列表
         self.agents = [f'sensor_{i}' for i in range(self.n_sensors)]
+        self.possible_agents = self.agents.copy()
 
-        # 存储动作历史（用于运动惩罚）
+        # 存储动作历史
         self.last_actions = np.zeros((self.n_sensors, dimension), dtype=np.float32)
 
-        # 动作空间：连续位移向量 Δx_i ∈ ℝ^D
+        # 动作空间：连续位移向量
         self.action_space = spaces.Dict({
             f'sensor_{i}': spaces.Box(
-                low=-1.0, high=1.0,  # 归一化动作范围
+                low=-1.0, high=1.0,
                 shape=(dimension,), dtype=np.float32
             ) for i in range(self.n_sensors)
         })
 
-        # 状态空间维度计算 - 根据设计修改
-        max_neighbors = self.n_sensors - 1  # 最大邻居数
-        max_anchors_per_sensor = self.n_anchors  # 最大锚点数
+        # 单一动作空间接口
+        self.single_action_space = spaces.Box(
+            low=-1.0, high=1.0,
+            shape=(dimension,), dtype=np.float32
+        )
 
-        # 根据设计的状态空间修改
+        # 状态空间维度计算
+        max_neighbors = self.n_sensors - 1
+        max_anchors_per_sensor = self.n_anchors
+
         state_dim_per_sensor = (
                 dimension +  # 当前位置估计
-                max_neighbors * (dimension + 1) +  # 邻居相对位置 + 距离测量 + 噪声标准差
-                max_anchors_per_sensor * (dimension + 1) +  # 锚点相对位置 + 距离测量 + 噪声标准差
-                dimension  # 最近一步位移 (motion_history)
+                max_neighbors * (dimension + 1) +  # 邻居相对位置 + 距离测量
+                max_anchors_per_sensor * (dimension + 1) +  # 锚点相对位置 + 距离测量
+                dimension  # 最近一步位移
         )
 
         self.observation_space = spaces.Dict({
@@ -91,30 +83,56 @@ class SensorNetworkLocalizationEnv(gym.Env):
             ) for i in range(self.n_sensors)
         })
 
+        # 单一观测空间接口
+        self.single_observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(state_dim_per_sensor,), dtype=np.float32
+        )
+
+        # 中心化观测空间
+        if self.use_centralized_critic:
+            centralized_obs_dim = (
+                    self.n_sensors * state_dim_per_sensor +  # 所有智能体的局部观测
+                    self.n_anchors * dimension +  # 锚点位置
+                    self.n_sensors * dimension  # 真实位置（训练时可用）
+            )
+            self.centralized_observation_space = spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(centralized_obs_dim,), dtype=np.float32
+            )
+
         # 环境状态
         self.render_mode = render_mode
-        self.true_positions = None  # 真实位置
-        self.estimated_positions = estimated_positions  # 估计位置
-        self.anchor_positions = None  # 锚点位置
-        self.communication_graph = None  # 通信图
-        self.distance_measurements = None  # 距离测量
-        self.anchor_measurements = None  # 锚点距离测量
+        self.true_positions = None
+        self.estimated_positions = estimated_positions
+        self.anchor_positions = None
+        self.communication_graph = None
+        self.distance_measurements = None
+        self.anchor_measurements = None
 
         self.current_step = 0
         self.max_neighbors = max_neighbors
         self.max_anchors_per_sensor = max_anchors_per_sensor
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Dict[str, np.ndarray]:
+        # 奖励权重（支持动态调整）
+        self.reward_weights = {
+            'local_alignment': 1.0,
+            'motion_penalty': 1.0,
+            'global_consistency': 1.0,
+            'boundary_penalty': 1.0
+        }
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict[str, np.ndarray], Dict]:
         """重置环境"""
         super().reset(seed=seed)
         self.current_step = 0
         self.last_actions = np.zeros((self.n_sensors, self.dimension), dtype=np.float32)
 
         # 生成真实位置
-        self.true_positions = self.sensor_pos
+        self.true_positions = self.sensor_pos.copy()
 
         # 生成锚点位置
-        self.anchor_positions = self.anchors_pos
+        self.anchor_positions = self.anchors_pos.copy()
 
         # 初始化估计位置
         initial_noise = np.random.normal(0, self.noise_std * 2, size=self.true_positions.shape)
@@ -126,28 +144,41 @@ class SensorNetworkLocalizationEnv(gym.Env):
         # 生成距离测量
         self._generate_measurements()
 
-        return self._get_observations()
+        observations = self._get_observations()
 
-    def step(self, actions: Dict[str, np.ndarray]) -> Tuple[Dict, Dict, Dict, Dict]:
+        # MAPPO兼容性信息
+        info = {
+            'centralized_obs': self.get_centralized_observation() if self.use_centralized_critic else None,
+            'agent_mask': [True] * self.n_sensors,
+            'mean_localization_error': np.mean(np.linalg.norm(self.estimated_positions - self.true_positions, axis=1))
+        }
+
+        return observations, info
+
+    def step(self, actions: Dict[str, np.ndarray]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
         """执行一步动作"""
         self.current_step += 1
 
-        # 存储动作（用于奖励计算中的运动惩罚）
+        # 执行动作
         for i in range(self.n_sensors):
             action = actions[f'sensor_{i}']
-            # 缩放动作（根据环境范围）
             scaled_action = action * self.communication_range * 0.1
             self.last_actions[i] = scaled_action
-            self.estimated_positions[i] += scaled_action
+
+            # 更新位置并检查边界
+            new_pos = self.estimated_positions[i] + scaled_action
+            new_pos = self._clip_to_bounds(new_pos)
+            self.estimated_positions[i] = new_pos
 
         # 重新生成距离测量
         self._generate_measurements()
 
         # 计算奖励
-        rewards = self._compute_rewards()  # 修改为新的奖励计算函数
+        rewards = self._compute_rewards()
 
         # 检查终止条件
         done = self._check_done()
+        truncated = {'__all__': self.current_step >= self.max_episode_steps}
 
         # 获取新观测
         observations = self._get_observations()
@@ -155,7 +186,113 @@ class SensorNetworkLocalizationEnv(gym.Env):
         # 计算信息
         info = self._get_info()
 
-        return observations, rewards, done, info
+        # 添加MAPPO需要的信息
+        localization_errors = np.linalg.norm(self.estimated_positions - self.true_positions, axis=1)
+        info.update({
+            'centralized_obs': self.get_centralized_observation() if self.use_centralized_critic else None,
+            'agent_mask': [True] * self.n_sensors,
+            'individual_rewards': list(rewards.values()),
+            'global_reward': sum(rewards.values()) / len(rewards),
+            'mean_localization_error': np.mean(localization_errors),
+            'max_localization_error': np.max(localization_errors),
+            'boundary_violation_rate': self._get_boundary_violation_rate(),
+            'coordination_score': self._get_coordination_score(),
+            'convergence_rate': self._get_convergence_rate()
+        })
+
+        return observations, rewards, done, truncated, info
+
+    def _clip_to_bounds(self, position):
+        """将位置限制在边界内"""
+        clipped = position.copy()
+        clipped[0] = np.clip(clipped[0], self.initial_pos_bounds[0, 0], self.initial_pos_bounds[0, 1])
+        clipped[1] = np.clip(clipped[1], self.initial_pos_bounds[1, 0], self.initial_pos_bounds[1, 1])
+        return clipped
+
+    def _get_boundary_violation_rate(self):
+        """计算边界违反率"""
+        violations = 0
+        for pos in self.estimated_positions:
+            if (pos[0] <= self.initial_pos_bounds[0, 0] or pos[0] >= self.initial_pos_bounds[0, 1] or
+                    pos[1] <= self.initial_pos_bounds[1, 0] or pos[1] >= self.initial_pos_bounds[1, 1]):
+                violations += 1
+        return violations / self.n_sensors
+
+    def _get_coordination_score(self):
+        """计算协调得分"""
+        if not self.communication_graph.edges():
+            return 0.0
+
+        total_error = 0.0
+        count = 0
+
+        for edge in self.communication_graph.edges():
+            i, j = edge
+            if (i, j) in self.distance_measurements:
+                measured_dist = self.distance_measurements[(i, j)]
+                estimated_dist = np.linalg.norm(self.estimated_positions[i] - self.estimated_positions[j])
+                error = abs(measured_dist - estimated_dist)
+                total_error += error
+                count += 1
+
+        if count == 0:
+            return 0.0
+
+        avg_error = total_error / count
+        return max(0.0, 1.0 - avg_error / self.communication_range)
+
+    def _get_convergence_rate(self):
+        """计算收敛率"""
+        errors = np.linalg.norm(self.estimated_positions - self.true_positions, axis=1)
+        converged = np.sum(errors < self.communication_range * 0.1)
+        return converged / self.n_sensors
+
+    def get_centralized_observation(self) -> np.ndarray:
+        """获取中心化观测"""
+        if not self.use_centralized_critic:
+            return None
+
+        # 获取所有智能体的局部观测
+        local_observations = self._get_observations()
+        all_local_obs = []
+        for agent in self.agents:
+            all_local_obs.append(local_observations[agent])
+
+        # 构建中心化观测
+        centralized_obs = np.concatenate([
+            np.concatenate(all_local_obs),  # 所有局部观测
+            self.anchor_positions.flatten(),  # 锚点位置
+            self.true_positions.flatten(),  # 真实位置（训练时可用）
+        ])
+
+        return centralized_obs.astype(np.float32)
+
+    def get_agent_ids(self):
+        """返回所有智能体ID"""
+        return self.agents
+
+    def get_num_agents(self):
+        """返回智能体数量"""
+        return self.n_sensors
+
+    def get_action_dim(self):
+        """返回单个智能体的动作维度"""
+        return self.dimension
+
+    def get_obs_dim(self):
+        """返回单个智能体的观测维度"""
+        return self.single_observation_space.shape[0]
+
+    def get_state_dim(self):
+        """返回全局状态维度"""
+        if self.use_centralized_critic:
+            return self.centralized_observation_space.shape[0]
+        else:
+            return self.get_obs_dim() * self.n_sensors
+
+    def update_reward_weights(self, new_weights):
+        """更新奖励权重"""
+        self.reward_weights.update(new_weights)
 
     def _build_communication_graph(self) -> nx.Graph:
         """构建通信图"""
@@ -191,133 +328,65 @@ class SensorNetworkLocalizationEnv(gym.Env):
                 distance = np.linalg.norm(
                     self.true_positions[i] - self.anchor_positions[k]
                 )
-                if distance <= self.communication_range * 1.5:  # 锚点通信范围更大
+                if distance <= self.communication_range * 1.5:
                     noise = np.random.normal(0, self.noise_std)
                     self.anchor_measurements[(i, k)] = distance + noise
 
     def _get_observations(self) -> Dict[str, np.ndarray]:
-        """获取观测 - 根据设计修改"""
+        """获取观测"""
         observations = {}
 
         for i in range(self.n_sensors):
             # 当前位置估计
             current_pos = self.estimated_positions[i]
 
-            # 获取邻居信息 (使用相对位置)
+            # 获取邻居信息
             neighbors = list(self.communication_graph.neighbors(i))
-            neighbor_info = np.zeros((self.max_neighbors, self.dimension + 1))  # 相对位置 + 距离测量
-            neighbor_mask = np.zeros(self.max_neighbors)
+            neighbor_info = np.zeros((self.max_neighbors, self.dimension + 1))
 
             for idx, neighbor in enumerate(neighbors[:self.max_neighbors]):
                 rel_pos = self.estimated_positions[neighbor] - current_pos
                 neighbor_info[idx, :self.dimension] = rel_pos
 
-                # 使用测量距离
                 if (i, neighbor) in self.distance_measurements:
                     neighbor_info[idx, self.dimension] = self.distance_measurements[(i, neighbor)]
                 elif (neighbor, i) in self.distance_measurements:
                     neighbor_info[idx, self.dimension] = self.distance_measurements[(neighbor, i)]
 
-                neighbor_mask[idx] = 1.0
-
-            # 获取锚点信息 (使用相对位置)
-            anchor_info = np.zeros((self.max_anchors_per_sensor, self.dimension + 1))  # 相对位置 + 距离测量
-            anchor_mask = np.zeros(self.max_anchors_per_sensor)
-
+            # 获取锚点信息
+            anchor_info = np.zeros((self.max_anchors_per_sensor, self.dimension + 1))
             anchor_idx = 0
             for k in range(self.n_anchors):
                 if (i, k) in self.anchor_measurements and anchor_idx < self.max_anchors_per_sensor:
                     rel_pos = self.anchor_positions[k] - current_pos
                     anchor_info[anchor_idx, :self.dimension] = rel_pos
                     anchor_info[anchor_idx, self.dimension] = self.anchor_measurements[(i, k)]
-                    anchor_mask[anchor_idx] = 1.0
                     anchor_idx += 1
 
-            # 运动历史 (最近一步位移)
+            # 运动历史
             motion_history = self.last_actions[i]
 
-            # 组合状态 (根据设计)
+            # 组合状态
             state = np.concatenate([
-                current_pos,  # 自身位置
-                neighbor_info.flatten(),  # 邻居信息 (相对位置 + 距离)
-                anchor_info.flatten(),  # 锚点信息 (相对位置 + 距离)
-                motion_history  # 最近一步位移
+                current_pos,
+                neighbor_info.flatten(),
+                anchor_info.flatten(),
+                motion_history
             ])
 
             observations[f'sensor_{i}'] = state.astype(np.float32)
 
         return observations
 
-    def get_global_state(self):
-        """
-        获取全局状态 - MADDPG的Critic需要
-        返回所有智能体的观测和动作的组合
-        """
-        global_obs = []
-        for agent in self.agents:
-            agent_idx = int(agent.split('_')[1])
-            global_obs.append(self.estimated_positions[agent_idx])
-
-        # 构建全局状态，包含：
-        # 1. 所有智能体的当前估计位置
-        # 2. 所有锚点位置
-        # 3. 所有智能体的真实位置（用于中心化训练）
-        global_state = np.concatenate([
-            np.array(global_obs).flatten(),  # 所有智能体估计位置
-            self.anchor_positions.flatten(),  # 锚点位置
-            self.true_positions.flatten(),  # 真实位置（训练时可用）
-        ])
-
-        return global_state
-
-    def get_joint_action_space_size(self):
-        """返回联合动作空间大小"""
-        single_action_size = self.action_space[self.agents[0]].shape[0]
-        return single_action_size * len(self.agents)
-
-    def get_global_action_from_dict(self, actions_dict):
-        """
-        将字典形式的动作转换为全局动作向量
-
-        Args:
-            actions_dict: {agent_name: action_vector} 形式的动作字典
-
-        Returns:
-            np.ndarray: 全局动作向量
-        """
-        global_action = []
-        for agent in self.agents:
-            global_action.append(actions_dict[agent])
-        return np.concatenate(global_action)
-
-    def get_global_state_dim(self):
-        """返回全局状态维度"""
-        # 所有智能体估计位置 + 锚点位置 + 真实位置
-        return (self.n_sensors * self.dimension +  # 估计位置
-                self.n_anchors * self.dimension +  # 锚点位置
-                self.n_sensors * self.dimension)  # 真实位置
-
-    def get_local_observation_dim(self):
-        """返回单个智能体的观测维度"""
-        agent_name = self.agents[0]
-        return self.observation_space[agent_name].shape[0]
-
     def _compute_rewards(self) -> Dict[str, float]:
-        """
-        计算分层奖励结构：
-        1. 局部对齐奖励 (邻居和锚点)
-        2. 运动惩罚
-        3. 全局一致性奖励 (周期性计算)
-        """
+        """计算分层奖励结构"""
         rewards = {}
 
-        # 1. 计算局部奖励
+        # 计算各类奖励
         local_rewards = self._compute_local_rewards()
-
-        # 2. 运动惩罚
         motion_penalties = self._compute_motion_penalties()
+        boundary_penalties = self._compute_boundary_penalties()
 
-        # 3. 全局一致性奖励 (周期性计算)
         if self.current_step % self.global_reward_freq == 0:
             global_reward = self._compute_global_consistency_reward()
         else:
@@ -326,9 +395,10 @@ class SensorNetworkLocalizationEnv(gym.Env):
         # 组合奖励
         for i, agent in enumerate(self.agents):
             total_reward = (
-                    local_rewards[i] +
-                    motion_penalties[i] +
-                    global_reward
+                    self.reward_weights['local_alignment'] * local_rewards[i] +
+                    self.reward_weights['motion_penalty'] * motion_penalties[i] +
+                    self.reward_weights['boundary_penalty'] * boundary_penalties[i] +
+                    self.reward_weights['global_consistency'] * global_reward
             )
             rewards[agent] = total_reward * self.reward_scale
 
@@ -337,13 +407,12 @@ class SensorNetworkLocalizationEnv(gym.Env):
     def _compute_local_rewards(self) -> List[float]:
         """计算局部对齐奖励"""
         rewards = [0.0] * self.n_sensors
-        baseline = 0.1 * self.communication_range  # 基线值
+        baseline = 0.1 * self.communication_range
 
         for i in range(self.n_sensors):
             # 与邻居的测量误差
             neighbors = list(self.communication_graph.neighbors(i))
             for neighbor in neighbors:
-                # 获取测量距离
                 if (i, neighbor) in self.distance_measurements:
                     measured_distance = self.distance_measurements[(i, neighbor)]
                 elif (neighbor, i) in self.distance_measurements:
@@ -351,14 +420,12 @@ class SensorNetworkLocalizationEnv(gym.Env):
                 else:
                     continue
 
-                # 计算估计距离
                 estimated_distance = np.linalg.norm(
                     self.estimated_positions[i] - self.estimated_positions[neighbor]
                 )
 
-                # 计算加权误差
                 error = abs(measured_distance - estimated_distance) - baseline
-                weight = 1.0 / (self.noise_std ** 2)  # 权重与噪声方差成反比
+                weight = 1.0 / (self.noise_std ** 2)
                 rewards[i] -= weight * error
 
             # 与锚点的测量误差
@@ -369,9 +436,8 @@ class SensorNetworkLocalizationEnv(gym.Env):
                         self.estimated_positions[i] - self.anchor_positions[k]
                     )
 
-                    # 计算加权误差
                     error = abs(measured_distance - estimated_distance) - baseline
-                    weight = 1.0 / (self.noise_std ** 2)  # 权重与噪声方差成反比
+                    weight = 1.0 / (self.noise_std ** 2)
                     rewards[i] -= weight * error
 
         return rewards
@@ -379,12 +445,30 @@ class SensorNetworkLocalizationEnv(gym.Env):
     def _compute_motion_penalties(self) -> List[float]:
         """计算运动惩罚"""
         penalties = []
-        motion_penalty_coeff = 0.01  # 运动惩罚系数
+        motion_penalty_coeff = 0.01
 
         for i in range(self.n_sensors):
-            # 惩罚位移大小
             motion_magnitude = np.linalg.norm(self.last_actions[i])
             penalties.append(-motion_penalty_coeff * motion_magnitude)
+
+        return penalties
+
+    def _compute_boundary_penalties(self) -> List[float]:
+        """计算边界惩罚"""
+        penalties = []
+        boundary_penalty_coeff = 1.0
+
+        for i in range(self.n_sensors):
+            pos = self.estimated_positions[i]
+            penalty = 0.0
+
+            # 检查边界违反
+            if pos[0] <= self.initial_pos_bounds[0, 0] or pos[0] >= self.initial_pos_bounds[0, 1]:
+                penalty += boundary_penalty_coeff
+            if pos[1] <= self.initial_pos_bounds[1, 0] or pos[1] >= self.initial_pos_bounds[1, 1]:
+                penalty += boundary_penalty_coeff
+
+            penalties.append(-penalty)
 
         return penalties
 
@@ -396,15 +480,6 @@ class SensorNetworkLocalizationEnv(gym.Env):
         total_consistency = 0.0
         count = 0
 
-        # 构建当前全局距离矩阵
-        est_dists = np.zeros((self.n_sensors, self.n_sensors))
-        for i in range(self.n_sensors):
-            for j in range(i + 1, self.n_sensors):
-                dist = np.linalg.norm(self.estimated_positions[i] - self.estimated_positions[j])
-                est_dists[i, j] = dist
-                est_dists[j, i] = dist
-
-        # 计算拓扑一致性
         for edge in self.communication_graph.edges():
             i, j = edge
             if (i, j) in self.distance_measurements:
@@ -414,8 +489,7 @@ class SensorNetworkLocalizationEnv(gym.Env):
             else:
                 continue
 
-            est_dist = est_dists[i, j]
-            # 使用高斯核函数计算一致性
+            est_dist = np.linalg.norm(self.estimated_positions[i] - self.estimated_positions[j])
             consistency = np.exp(-(true_dist - est_dist) ** 2 / (2 * self.noise_std ** 2))
             total_consistency += consistency
             count += 1
@@ -428,7 +502,7 @@ class SensorNetworkLocalizationEnv(gym.Env):
 
     def _check_done(self) -> Dict[str, bool]:
         """检查终止条件"""
-        done = {'__all__': self.current_step >= self.max_episode_steps}
+        done = {'__all__': False}
 
         # 收敛检查
         localization_errors = np.linalg.norm(
@@ -436,7 +510,6 @@ class SensorNetworkLocalizationEnv(gym.Env):
         )
         max_error = np.max(localization_errors)
 
-        # 如果最大定位误差小于通信范围的5%，则认为已收敛
         if max_error < self.communication_range * 0.05:
             done['__all__'] = True
 
@@ -449,8 +522,6 @@ class SensorNetworkLocalizationEnv(gym.Env):
         )
 
         return {
-            'mean_localization_error': np.mean(localization_errors),
-            'max_localization_error': np.max(localization_errors),
             'step': self.current_step,
             'true_positions': self.true_positions.copy(),
             'estimated_positions': self.estimated_positions.copy()
@@ -486,11 +557,9 @@ class SensorNetworkLocalizationEnv(gym.Env):
                          [self.true_positions[i, 1], self.estimated_positions[i, 1]],
                          'orange', alpha=0.5, linewidth=2)
 
-            # 使用边界设置坐标轴范围
             x_min, x_max = self.initial_pos_bounds[0]
             y_min, y_max = self.initial_pos_bounds[1]
 
-            # 添加一些边距以便更好地观察
             x_margin = (x_max - x_min) * 0.1
             y_margin = (y_max - y_min) * 0.1
 
@@ -510,95 +579,49 @@ class SensorNetworkLocalizationEnv(gym.Env):
         pass
 
 
-class MultiAgentWrapper:
-    """
-    多智能体环境包装器，兼容主流MARL框架
-    """
+class MAPPOWrapper:
+    """MAPPO环境包装器"""
 
     def __init__(self, env):
         self.env = env
         self.agents = [f'sensor_{i}' for i in range(env.n_sensors)]
+        self.num_agents = env.n_sensors
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Dict[str, np.ndarray]:
-        return self.env.reset(seed=seed, options=options)
+    def reset(self, seed: Optional[int] = None):
+        obs, info = self.env.reset(seed=seed)
+        return obs, info
 
-    def step(self, actions: Dict[str, np.ndarray]) -> Tuple[Dict, Dict, Dict, Dict]:
+    def step(self, actions: Dict[str, np.ndarray]):
         return self.env.step(actions)
 
-    def render(self, mode: str = 'human') -> Any:
+    def render(self, mode: str = 'human'):
         return self.env.render(mode)
 
-    def close(self) -> None:
+    def close(self):
         return self.env.close()
 
     @property
-    def observation_space(self) -> spaces.Dict:
-        return self.env.observation_space
+    def observation_space(self):
+        return self.env.single_observation_space
 
     @property
-    def action_space(self) -> spaces.Dict:
-        return self.env.action_space
+    def action_space(self):
+        return self.env.single_action_space
 
+    def get_centralized_observation(self):
+        return self.env.get_centralized_observation()
 
-# 使用示例
-if __name__ == "__main__":
-    # 示例：定义锚点和传感器位置
-    np.random.seed(42)
-    anchors_pos = np.array([[0.0, 0.0], [250.0, 0.0], [0.0, 200.0], [250.0, 200.0]])
-    sensor_pos = np.array([
-        [50.0, 50.0], [100.0, 80.0], [150.0, 50.0], [200.0, 100.0],
-        [50.0, 150.0], [100.0, 120.0], [150.0, 150.0], [200.0, 180.0]
-    ])
+    def get_agent_ids(self):
+        return self.env.get_agent_ids()
 
-    # 初始估计位置（添加噪声）
-    estimated_positions = sensor_pos + np.random.normal(0, 15, sensor_pos.shape)
+    def get_num_agents(self):
+        return self.env.get_num_agents()
 
-    # 创建环境
-    env = SensorNetworkLocalizationEnv(
-        anchors_pos=anchors_pos,
-        sensor_pos=sensor_pos,
-        estimated_positions=estimated_positions,
-        communication_range=80.0,
-        noise_std=1.5,
-        initial_pos_bounds=np.array([[-50.0, 300.0], [-50.0, 250.0]]),
-        reward_scale=0.1,
-        global_reward_freq=3
-    )
+    def get_obs_dim(self):
+        return self.env.get_obs_dim()
 
-    # 包装为多智能体环境
-    multi_env = MultiAgentWrapper(env)
+    def get_action_dim(self):
+        return self.env.get_action_dim()
 
-    # 测试环境
-    obs = multi_env.reset()
-    print("观测空间维度:", {k: v.shape for k, v in list(obs.items())[:3]})  # 只显示前3个
-    print("动作空间:", {k: v for k, v in list(multi_env.action_space.spaces.items())[:3]})
-
-    # 测试MADDPG需要的功能
-    print(f"全局状态维度: {env.get_global_state_dim()}")
-    print(f"联合动作空间大小: {env.get_joint_action_space_size()}")
-    print(f"单智能体观测维度: {env.get_local_observation_dim()}")
-
-    global_state = env.get_global_state()
-    print(f"当前全局状态形状: {global_state.shape}")
-
-    # 随机动作测试
-    for step in range(5):
-        actions = {}
-        for agent in multi_env.agents:
-            actions[agent] = multi_env.action_space[agent].sample()
-
-        obs, rewards, done, info = multi_env.step(actions)
-
-        # 测试全局动作转换
-        global_action = env.get_global_action_from_dict(actions)
-        print(f"Step {step + 1}:")
-        print(f"  平均定位误差: {info['mean_localization_error']:.4f}")
-        print(f"  前3个智能体奖励: {[(k, f'{v:.4f}') for k, v in list(rewards.items())[:3]]}")
-        print(f"  全局动作形状: {global_action.shape}")
-
-        # 渲染环境
-        multi_env.render()
-
-        if done['__all__']:
-            print("Episode finished early due to convergence!")
-            break
+    def get_state_dim(self):
+        return self.env.get_state_dim()
