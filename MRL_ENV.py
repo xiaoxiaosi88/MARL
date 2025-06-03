@@ -21,7 +21,7 @@ class SensorNetworkLocalizationEnv(gym.Env):
                  estimated_positions: np.ndarray,
                  communication_range: float = 3.0,
                  noise_std: float = 0.1,
-                 max_episode_steps: int = 100,
+                    
                  initial_pos_bounds: np.ndarray = np.array([[-50.0, 300.0], [-50.0, 250.0]]),
                  render_mode: str = None,
                  dimension: int = 2,
@@ -247,7 +247,9 @@ class SensorNetworkLocalizationEnv(gym.Env):
         converged = np.sum(errors < self.communication_range * 0.1)
         return converged / self.n_sensors
 
-    def get_centralized_observation(self) -> np.ndarray:
+    from typing import Optional
+
+    def get_centralized_observation(self) -> Optional[np.ndarray]:
         """获取中心化观测"""
         if not self.use_centralized_critic:
             return None
