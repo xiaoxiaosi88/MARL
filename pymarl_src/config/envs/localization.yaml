@@ -1,0 +1,28 @@
+env: localization
+
+env_args:
+  # Localization environment specific parameters
+  anchors_pos: [[-500, 0], [0, -500], [500, 0], [0, 500]]
+  sensor_pos: [[150, 0], [-150, 0], [0, 150], [0, -150], [300, 300], [-300, 300], [300, -300], [-300, -300]]
+  estimated_positions: [[20, 0], [-10, 0], [90, 80], [50, -150], [10, 10], [100, -100], [10, 0], [20, 80]]
+  communication_range: 250
+  sensor_noise_std: 5.0
+  anchor_noise_std: 3.0
+  dimension: 2
+  convergence_threshold: 2
+  max_episode_steps: 100
+  action_magnitude: 1.0
+  initial_pos_bounds: [[-300.0, 300.0], [-300.0, 300.0]]
+  boundary_penalty: -100.0
+  boundary_enforcement: "penalty"
+
+# Testing and logging parameters
+test_greedy: True
+test_nepisode: 10
+test_interval: 5000
+log_interval: 1000
+runner_log_interval: 1000
+learner_log_interval: 1000
+
+# Training parameters
+t_max: 100000
