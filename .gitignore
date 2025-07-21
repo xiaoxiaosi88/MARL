@@ -25,9 +25,10 @@ MANIFEST
 *.pth
 *.pt
 
-# Logs
+# Logs and results
 logs/
 Results/
+results/
 *.log
 
 # IDE

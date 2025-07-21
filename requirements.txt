@@ -1,0 +1,18 @@
+# Core dependencies for MARL Localization Environment
+numpy>=1.15.0
+torch>=1.0.0
+pettingzoo>=1.20.0
+gymnasium>=1.0.0
+networkx>=2.5
+
+# PyMARL dependencies
+sacred>=0.7.0
+pymongo>=3.7.0
+tensorboard-logger>=0.1.0
+scipy>=1.1.0
+pillow>=6.0.0
+gitpython>=3.0.0
+
+# Optional for better performance
+# matplotlib>=3.0.0
+# seaborn>=0.11.0
